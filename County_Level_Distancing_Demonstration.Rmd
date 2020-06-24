@@ -1,0 +1,157 @@
+---
+title: "Social Distancing by State"
+author: "Nick Huntington-Klein"
+date: "4/30/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,warning = FALSE,message = FALSE)
+```
+
+## Libraries
+
+```{r}
+# Make sure these are all installed
+
+# Data manipulation and graphing
+library(tidyverse)
+# Handling dates
+library(lubridate)
+# Reading Excel files
+library(readxl)
+# Looking at the data
+library(vtable)
+```
+
+## Load in Data
+
+We begin by loading in a data set of the raw social-distancing data aggregated together at the county-date level, which I've stored in the data set `Social_Distancing_From_Feb1.Rdata`
+
+```{r}
+load('Social_Distancing_From_Feb1.Rdata')
+
+# Here's what's in the data
+vtable(compiled_data, lush = TRUE)
+```
+
+Next, we bring in population by county so that we can adjust for different sampling rates. I have population by county in 2019 from the American Community Survey (ACS) in the file `county_pop.xlsx`
+
+```{r}
+# 2019 popualtion by state/county AND also our link for state and county names
+ctypop <- read_excel('county_pop.xlsx') %>%
+  # county = 0 indicates "the state"as a whole and we want counties
+  filter(county != 0) %>%
+  select(state,county,statename,countyname,popcty2019)
+```
+
+## Merge everything
+
+Now I just merge the two together so I can add the `countyname` and `popcty2019` variables on. Note that in my file, `compiled_data` stores `state` and `county` indicators as strings so we need to conver them to numeric first.
+
+```{r}
+compiled_data <- compiled_data %>%
+  mutate(state = as.numeric(state),
+         county = as.numeric(county)) %>%
+  left_join(ctypop) %>%
+  # I want to focus on the main 50 states, not e.g. Guam
+  filter(state <= 56) %>%
+  # Make sure there weren't any blank rows that snuck in
+  filter(!is.na(state),!is.na(county))
+```
+
+## Step 1: Adjust for Unequal Sampling Rates
+
+We want to adjust the device numbers in the data to population size. We follow the steps [here](https://www.safegraph.com/blog/measuring-and-correcting-sampling-bias-for-accurate-demographic-analysis).
+
+```{r}
+compiled_data <- compiled_data %>%
+  group_by(state, Date) %>%
+  # Get full population by state in each time period, and full in-sample count by state
+  mutate(state_pop = sum(popcty2019, na.rm = TRUE),
+         sample_pop = sum(device_count, na.rm = TRUE)) %>%
+  ungroup() %>%
+  # Now adjust the device count and the home device count
+  mutate(adjust_factor = (popcty2019/state_pop)*(sample_pop/device_count)) %>%
+  mutate(adj_device_count = device_count*adjust_factor,
+         adj_home_count = completely_home_device_count*adjust_factor)
+```
+
+## Step 2: Adjust for Small Samples
+
+Now we use a hierarchical Bayesian model to adjust the values. This will largely affect counties with small samples, since they will be noisily estimated. The Bayesian model pulls them towards the means of their states, assuming that the states have information useful for estimating prevalence in those small areas. We follow the steps [here](https://docs.google.com/document/d/1qAXl5iHJZCuyIPnawMHa6WoKULhsx404flTAGq0bStA/edit).
+
+```{r}
+# First, estimate the hyperparameter theta (the mean stay-home rate in each STATE)
+# As well as our estimate of the variance of theta
+compiled_data <- compiled_data %>%
+  group_by(state, Date) %>%
+  mutate(expected_theta = mean(adj_home_count/adj_device_count),
+         var_theta = var(adj_home_count/adj_device_count)/n()) %>%
+  # Now we can estimate the parameters of the beta distribution
+  # (these formulae basically come from a standard beta distribution estimation procedure)
+  mutate(alpha_plus_beta = (expected_theta*(1-expected_theta)/var_theta)-1) %>%
+  mutate(alpha = alpha_plus_beta*expected_theta,
+         beta = alpha_plus_beta*(1-expected_theta)) %>%
+  ungroup()
+```
+
+What we have now are our state-level prior $$\alpha$$ and $$\beta$$ values for our [beta distribution](https://en.wikipedia.org/wiki/Beta_distribution).
+
+We will take these alpha and beta values as our starting place. Then, for the results we get for each *county*, we move these priors into posteriors. For places with a lot of observations, they'll move a lot, swamping out the prior. For places with not a lot of observations, they won't move as much, and the state-level information will help inform those values.
+
+```{r}
+compiled_data <- compiled_data %>%
+  mutate(posterior_alpha = alpha + adj_home_count,
+         posterior_beta = beta + (adj_device_count - adj_home_count)) %>%
+  # Finally, estimate the mean of the beta distribution 
+  mutate(mean_estimate = 100*posterior_alpha/(posterior_alpha+posterior_beta))
+```
+
+How different does this make things?
+
+```{r}
+ggplot(compiled_data, aes(x=100*adj_home_count/adj_device_count, y=mean_estimate)) + 
+  geom_point() + 
+  labs(x = 'Original Estimate',
+       y = 'Bayes-Adjusted Estimate') + 
+  coord_fixed() + 
+  theme_minimal()
+```
+
+You can see theree are a lot of original estimates on the edges (far left or right) that end up closer to the middle (neither top nor bottom), being "pulled in" to the mean by the Bayes estimator. These are typically smaller counties for which we have fewer observations.
+
+
+# Step 3: 7-Day Moving Average
+
+Now we have our daily estimate. We can finalize this by smoothing things out (and handling weekend patterns) by taking the mean over the past seven days
+
+```{r}
+# Function to calculate a seven-day moving average
+ma <- function(x,n=7){as.numeric(stats::filter(as.ts(x),rep(1/n,n), sides=1))}
+
+compiled_data <- compiled_data %>%
+  # Make sure it's grouped by county and in date order
+  group_by(state,county) %>%
+  # There is one county that only shows up for a few days, we can't use them
+  filter(n() > 7) %>%
+  arrange(Date) %>%
+  mutate(mean_estimate_ma = ma(mean_estimate)) %>%
+  ungroup()
+```
+
+## Step 4: Indexing
+
+We can turn our result into an index by taking it all relative to a certain day. We will be subtracting out whatever the value is on February 12.
+
+```{r}
+compiled_data <- compiled_data %>%
+  # Put Feb 12 at the top of the data so we can refer to it with first()
+  group_by(state, county) %>%
+  arrange(-(Date == ymd('2020-02-12'))) %>%
+  mutate(sd_index = mean_estimate_ma - first(mean_estimate_ma)) %>%
+  # And put back in order
+  ungroup() %>%
+  arrange(state, county, Date)
+```
+```
